@@ -336,6 +336,16 @@ void CoreContext::Initiate(void) {
   // Signal our condition variable
   m_stateBlock->m_stateChanged.notify_all();
 
+  // HACK:  Start the AutoPacketFactory first, if it exists in this context
+  // This prevents errors from arising from threads in the current context attempting to
+  // use AutoPacketFactory before it's ready.
+  {
+    AnySharedPointerT<AutoPacketFactory> pf;
+    FindByTypeUnsafe(pf);
+    if(pf)
+      pf->Start(outstanding);
+  }
+
   for(auto q : m_threads)
     q->Start(outstanding);
 }
