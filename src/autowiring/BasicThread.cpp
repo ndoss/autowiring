@@ -30,7 +30,7 @@ void BasicThread::DoRun(std::shared_ptr<Object>&& refTracker) {
   // Make our own session current before we do anything else:
   CurrentContextPusher pusher(GetContext());
 
-  // Set the thread name no matter what:
+  // Set the thread name if one exists:
   if(GetName())
     SetCurrentThreadName();
 
