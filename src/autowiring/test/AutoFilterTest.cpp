@@ -5,6 +5,7 @@
 #include <autowiring/AutoPacket.h>
 #include <autowiring/AutoPacketFactory.h>
 #include <autowiring/NewAutoFilter.h>
+#include <autowiring/ExceptionFilter.h>
 #include THREAD_HEADER
 
 TEST_F(AutoFilterTest, VerifyDescendentAwareness) {
@@ -885,4 +886,197 @@ TEST_F(AutoFilterTest, GetSharedPointer) {
   const std::shared_ptr<Decoration<0>>* dec2;
   packet->Get(dec2);
   ASSERT_EQ(dec, dec2) << "Decoration was moved incorrectly after updates were made";
+}
+class LeaksLikeASieve:
+  public CoreThread
+{
+public:
+  LeaksLikeASieve(void):
+    m_index{0}
+  {}
+
+  size_t m_index;
+
+  Deferred AutoFilter(const Decoration<0>& decIn, auto_out<Decoration<1>> output) {
+    // Drop one out of 100 packets
+    if(m_index++ % 100)
+      output.Cancel();
+
+    return Deferred(this);
+  }
+};
+
+class CountsDecorationOne:
+  public CoreThread
+{
+public:
+  CountsDecorationOne(void) :
+    m_count{0}
+  {}
+
+  size_t m_count;
+
+  Deferred AutoFilter(AutoPacket& packet, const Decoration<1>& decIn) {
+    m_count++;
+    packet.Decorate(Decoration<2>());
+
+    return Deferred(this);
+  }
+};
+
+TEST_F(AutoFilterTest, DroppedPacketPathological) {
+  AutoCurrentContext ctxt;
+  ctxt->Initiate();
+  AutoRequired<AutoPacketFactory> factory;
+  AutoRequired<LeaksLikeASieve> llas;
+  AutoRequired<CountsDecorationOne> cdo;
+
+  // Should be two subscribers at this point:
+  std::vector<AutoFilterDescriptor> afd;
+  factory->AppendAutoFiltersTo(afd);
+  ASSERT_EQ(2, afd.size()) << "Factory did not correctly register all AutoFilter instances";
+
+  // Check out some packets that we intend to satisfy in one long sequence
+  size_t nPackets = 1000;
+  std::vector<std::shared_ptr<AutoPacket>> packets(nPackets);
+  for(auto& cur : packets)
+    cur = factory->NewPacket();
+
+  // Decorate all of these packets, dropping some along the way
+  for(auto& cur : packets)
+    cur->Decorate(Decoration<0>());
+
+  // Rundown
+  packets.clear();
+  ctxt->SignalShutdown(true);
+
+  // Ratio validation:
+  ASSERT_EQ(nPackets / 100, cdo->m_count) << "Incorrect receipt count by the decoration-one counter";
+}
+
+class GeneratesPackets:
+  public BasicThread
+{
+public:
+  GeneratesPackets(size_t nPackets):
+    BasicThread("GeneratesPackets"),
+    m_nPackets(nPackets)
+  {}
+
+  const size_t m_nPackets;
+  AutoRequired<AutoPacketFactory> m_factory;
+
+  void Run(void) override {
+    for(size_t i = m_nPackets; i--;) {
+      auto packet = m_factory->NewPacket();
+      packet->Decorate(Decoration<0>(i));
+      packet->Decorate(!i);
+    }
+  }
+};
+
+class BlocksTheNextGuy
+{
+public:
+  BlocksTheNextGuy(void) :
+    m_count(0)
+  {}
+
+  size_t m_count = 0;
+
+  void AutoFilter(AutoPacket& packet, const Decoration<0>&, Decoration<1>&) {
+    m_count++;
+  }
+};
+
+class WantsEverythingMaybeMakesSomething:
+  public CoreThread
+{
+public:
+  WantsEverythingMaybeMakesSomething(void) :
+    CoreThread("WantsEverythingMaybeMakesSomething"),
+    m_count(0)
+  {}
+
+  size_t m_count;
+
+  Deferred AutoFilter(AutoPacket& packet, const Decoration<0>&, const Decoration<1>&) {
+    m_count++;
+    packet.Decorate(Decoration<2>());
+    return Deferred(this);
+  }
+};
+
+class AcceptsEarlierValuesAsSharedPointer:
+  public CoreThread
+{
+public:
+  AcceptsEarlierValuesAsSharedPointer(void):
+    CoreThread("AcceptsEarlierValuesAsSharedPointer"),
+    m_count(0)
+  {}
+
+  size_t m_count;
+
+  Deferred AutoFilter(const std::shared_ptr<Decoration<2>> input, bool is_final) {
+    m_count++;
+    if(is_final)
+      this->Stop();
+    return Deferred(this);
+  }
+};
+
+class DoesntLikeExceptions:
+  public ExceptionFilter
+{
+public:
+  DoesntLikeExceptions(void):
+    m_excepted(false)
+  {}
+
+  bool m_excepted;
+
+  const std::type_info* m_ti;
+  std::string m_what;
+
+  void Filter(void) override {
+    m_excepted = true;
+    try {
+      throw;
+    }
+    catch(std::exception& except) {
+      m_ti = &typeid(except);
+      m_what = except.what();
+    }
+    catch(...) {}
+  }
+};
+
+TEST_F(AutoFilterTest, MultiStageReciept) {
+  const size_t nPackets = 1000;
+  AutoRequired<AutoPacketFactory> factory;
+  AutoConstruct<GeneratesPackets> gp(nPackets);
+  AutoRequired<BlocksTheNextGuy> af1;
+  AutoRequired<WantsEverythingMaybeMakesSomething> af2;
+  AutoRequired<AcceptsEarlierValuesAsSharedPointer> af3;
+  AutoRequired<DoesntLikeExceptions> dle;
+
+  AutoCurrentContext ctxt;
+  ctxt->Initiate();
+
+  // Wait for the generator and tail recipient to wrap up:
+  gp->Wait();
+  ASSERT_TRUE(af3->WaitFor(std::chrono::seconds(5))) << "Final filter took an excessive amount of time to trivially process all packets";
+
+  ctxt->SignalShutdown();
+  ctxt->Wait();
+
+  ASSERT_EQ(nPackets, af1->m_count);
+  ASSERT_EQ(nPackets, af2->m_count);
+  ASSERT_EQ(nPackets, af3->m_count);
+
+  // Validate that nothing went wrong:
+  ASSERT_FALSE(dle->m_excepted)
+    << "An exception occurred in this context" << std::endl
+    << "[" << (dle->m_ti ? dle->m_ti->name() : "unknown") << "] " << dle->m_what;
 }
